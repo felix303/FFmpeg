@@ -45,13 +45,15 @@ typedef struct PrebufferThread {
     atomic_int ready;
 } PrebufferThread;
 
+static void close_input(InputContext *ictx);
+
 static int open_input(const char *fname, InputContext *ictx)
 {
     memset(ictx, 0, sizeof(*ictx));
     if (avformat_open_input(&ictx->fmt_ctx, fname, NULL, NULL) < 0)
-        return -1;
+        goto fail;
     if (avformat_find_stream_info(ictx->fmt_ctx, NULL) < 0)
-        return -1;
+        goto fail;
     ictx->vstream = av_find_best_stream(ictx->fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     ictx->astream = av_find_best_stream(ictx->fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (ictx->vstream >= 0) {
@@ -74,6 +76,9 @@ static int open_input(const char *fname, InputContext *ictx)
     }
     ictx->frame = av_frame_alloc();
     return 0;
+fail:
+    close_input(ictx);
+    return -1;
 }
 
 static void close_input(InputContext *ictx)
