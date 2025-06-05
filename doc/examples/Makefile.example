@@ -36,7 +36,8 @@ EXAMPLES=\
                 scale_video                        \
                 show_metadata                      \
                 transcode_aac                      \
-                transcode
+                transcode                          \
+                playlist_concat
 
 OBJS=$(addsuffix .o,$(EXAMPLES))
 
