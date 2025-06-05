@@ -9,10 +9,7 @@
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
-#include <libavutil/opt.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/audio_fifo.h>
-#include <libavutil/channel_layout.h>
+
 
 #define OUTPUT_WIDTH 1920
 #define OUTPUT_HEIGHT 1080
