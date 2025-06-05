@@ -29,6 +29,7 @@ typedef struct InputContext {
     struct SwsContext *sws;
     struct SwrContext *swr;
     AVFrame *frame;
+    double duration;
 } InputContext;
 
 typedef struct OutputContext {
@@ -44,6 +45,7 @@ typedef struct PrebufferThread {
     char filename[1024];
     InputContext ictx;
     atomic_int ready;
+    int running;
 } PrebufferThread;
 
 static int open_input(const char *fname, InputContext *ictx)
@@ -79,6 +81,15 @@ static int open_input(const char *fname, InputContext *ictx)
         swr_init(ictx->swr);
     }
     ictx->frame = av_frame_alloc();
+    if (ictx->vstream >= 0 &&
+        ictx->fmt_ctx->streams[ictx->vstream]->duration != AV_NOPTS_VALUE) {
+        ictx->duration = ictx->fmt_ctx->streams[ictx->vstream]->duration *
+                        av_q2d(ictx->fmt_ctx->streams[ictx->vstream]->time_base);
+    } else if (ictx->fmt_ctx->duration != AV_NOPTS_VALUE) {
+        ictx->duration = ictx->fmt_ctx->duration / (double)AV_TIME_BASE;
+    } else {
+        ictx->duration = 0;
+    }
     return 0;
 }
 
@@ -173,7 +184,9 @@ static int encode_write(AVCodecContext *enc_ctx, AVFrame *frame, AVPacket *pkt, 
     return 0;
 }
 
-static int process(InputContext *ictx, OutputContext *octx, int64_t *vpts_off, int64_t *apts_off)
+static int process(InputContext *ictx, OutputContext *octx,
+                   int64_t *vpts_off, int64_t *apts_off,
+                   PrebufferThread *prebuf)
 {
     AVPacket pkt;
     av_packet_init(&pkt);
@@ -188,6 +201,14 @@ static int process(InputContext *ictx, OutputContext *octx, int64_t *vpts_off, i
                 out->height = OUTPUT_HEIGHT;
                 av_frame_get_buffer(out, 0);
                 sws_scale(ictx->sws, (const uint8_t * const*)f->data, f->linesize, 0, ictx->vdec_ctx->height, out->data, out->linesize);
+                if (prebuf && prebuf->filename[0] && !prebuf->running && ictx->duration > 0) {
+                    double cur = f->pts * av_q2d(ictx->fmt_ctx->streams[ictx->vstream]->time_base);
+                    if (ictx->duration - cur <= PREBUFFER_SECONDS) {
+                        prebuf->running = 1;
+                        prebuf->ready = 0;
+                        pthread_create(&prebuf->thread, NULL, prebuffer_func, prebuf);
+                    }
+                }
                 out->pts = av_rescale_q(f->pts, ictx->fmt_ctx->streams[ictx->vstream]->time_base, octx->venc_ctx->time_base) + *vpts_off;
                 encode_write(octx->venc_ctx, out, &pkt, octx->fmt_ctx, octx->vstream->index);
                 *vpts_off = out->pts + 1;
@@ -240,6 +261,11 @@ static int process(InputContext *ictx, OutputContext *octx, int64_t *vpts_off, i
         *apts_off = out->pts + out->nb_samples;
         av_frame_free(&out);
     }
+    if (prebuf && prebuf->filename[0] && !prebuf->running) {
+        prebuf->running = 1;
+        prebuf->ready = 0;
+        pthread_create(&prebuf->thread, NULL, prebuffer_func, prebuf);
+    }
     return 0;
 }
 
@@ -279,18 +305,21 @@ int main(int argc, char **argv)
     PrebufferThread prebuf = {0};
 
     while (1) {
-        // start prebuffer for next file
         if (read_next_path(pl, prebuf.filename, sizeof(prebuf.filename)) == 0) {
             prebuf.ready = 0;
-            pthread_create(&prebuf.thread, NULL, prebuffer_func, &prebuf);
+            prebuf.running = 0;
         } else {
             prebuf.filename[0] = '\0';
         }
 
-        process(&ictx, &octx, &vpts_off, &apts_off);
+        process(&ictx, &octx, &vpts_off, &apts_off,
+                prebuf.filename[0] ? &prebuf : NULL);
         close_input(&ictx);
         if (prebuf.filename[0]) {
-            pthread_join(prebuf.thread, NULL);
+            if (prebuf.running)
+                pthread_join(prebuf.thread, NULL);
+            else
+                open_input(prebuf.filename, &prebuf.ictx);
             ictx = prebuf.ictx;
         } else {
             break;
