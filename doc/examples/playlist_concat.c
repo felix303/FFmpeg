@@ -10,6 +10,7 @@
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 
+
 #define OUTPUT_WIDTH 1920
 #define OUTPUT_HEIGHT 1080
 #define OUTPUT_FPS 25
@@ -25,6 +26,7 @@ typedef struct InputContext {
     struct SwsContext *sws;
     struct SwrContext *swr;
     AVFrame *frame;
+    double duration;
 } InputContext;
 
 typedef struct OutputContext {
@@ -40,15 +42,18 @@ typedef struct PrebufferThread {
     char filename[1024];
     InputContext ictx;
     atomic_int ready;
+    int running;
 } PrebufferThread;
+
+static void close_input(InputContext *ictx);
 
 static int open_input(const char *fname, InputContext *ictx)
 {
     memset(ictx, 0, sizeof(*ictx));
     if (avformat_open_input(&ictx->fmt_ctx, fname, NULL, NULL) < 0)
-        return -1;
+        goto fail;
     if (avformat_find_stream_info(ictx->fmt_ctx, NULL) < 0)
-        return -1;
+        goto fail;
     ictx->vstream = av_find_best_stream(ictx->fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     ictx->astream = av_find_best_stream(ictx->fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (ictx->vstream >= 0) {
@@ -64,13 +69,30 @@ static int open_input(const char *fname, InputContext *ictx)
         ictx->adec_ctx = avcodec_alloc_context3(dec);
         avcodec_parameters_to_context(ictx->adec_ctx, ictx->fmt_ctx->streams[ictx->astream]->codecpar);
         avcodec_open2(ictx->adec_ctx, dec, NULL);
-        ictx->swr = swr_alloc_set_opts(NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_FLTP, OUTPUT_SAMPLE_RATE,
-                                       ictx->adec_ctx->channel_layout ? ictx->adec_ctx->channel_layout : av_get_default_channel_layout(ictx->adec_ctx->channels),
-                                       ictx->adec_ctx->sample_fmt, ictx->adec_ctx->sample_rate, 0, NULL);
+        AVChannelLayout out_ch_layout, in_ch_layout;
+        av_channel_layout_default(&out_ch_layout, 2);
+        if (ictx->adec_ctx->ch_layout.nb_channels)
+            av_channel_layout_copy(&in_ch_layout, &ictx->adec_ctx->ch_layout);
+        else
+            av_channel_layout_default(&in_ch_layout, ictx->adec_ctx->channels);
+        swr_alloc_set_opts2(&ictx->swr, &out_ch_layout, AV_SAMPLE_FMT_FLTP, OUTPUT_SAMPLE_RATE,
+                            &in_ch_layout, ictx->adec_ctx->sample_fmt, ictx->adec_ctx->sample_rate, 0, NULL);
         swr_init(ictx->swr);
     }
     ictx->frame = av_frame_alloc();
+    if (ictx->vstream >= 0 &&
+        ictx->fmt_ctx->streams[ictx->vstream]->duration != AV_NOPTS_VALUE) {
+        ictx->duration = ictx->fmt_ctx->streams[ictx->vstream]->duration *
+                        av_q2d(ictx->fmt_ctx->streams[ictx->vstream]->time_base);
+    } else if (ictx->fmt_ctx->duration != AV_NOPTS_VALUE) {
+        ictx->duration = ictx->fmt_ctx->duration / (double)AV_TIME_BASE;
+    } else {
+        ictx->duration = 0;
+    }
     return 0;
+fail:
+    close_input(ictx);
+    return -1;
 }
 
 static void close_input(InputContext *ictx)
@@ -106,7 +128,7 @@ static int init_output(const char *fname, OutputContext *octx)
     octx->astream = avformat_new_stream(octx->fmt_ctx, aenc);
     octx->aenc_ctx = avcodec_alloc_context3(aenc);
     octx->aenc_ctx->sample_rate = OUTPUT_SAMPLE_RATE;
-    octx->aenc_ctx->channel_layout = AV_CH_LAYOUT_STEREO;
+    av_channel_layout_default(&octx->aenc_ctx->ch_layout, 2);
     octx->aenc_ctx->channels = 2;
     octx->aenc_ctx->sample_fmt = aenc->sample_fmts ? aenc->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
     octx->aenc_ctx->time_base = (AVRational){1, OUTPUT_SAMPLE_RATE};
@@ -164,10 +186,12 @@ static int encode_write(AVCodecContext *enc_ctx, AVFrame *frame, AVPacket *pkt, 
     return 0;
 }
 
-static int process(InputContext *ictx, OutputContext *octx, int64_t *vpts_off, int64_t *apts_off)
+static int process(InputContext *ictx, OutputContext *octx,
+                   int64_t *vpts_off, int64_t *apts_off,
+                   PrebufferThread *prebuf)
 {
     AVPacket pkt;
-    av_init_packet(&pkt);
+    av_packet_init(&pkt);
     while (av_read_frame(ictx->fmt_ctx, &pkt) >= 0) {
         if (pkt.stream_index == ictx->vstream) {
             avcodec_send_packet(ictx->vdec_ctx, &pkt);
@@ -179,6 +203,14 @@ static int process(InputContext *ictx, OutputContext *octx, int64_t *vpts_off, i
                 out->height = OUTPUT_HEIGHT;
                 av_frame_get_buffer(out, 0);
                 sws_scale(ictx->sws, (const uint8_t * const*)f->data, f->linesize, 0, ictx->vdec_ctx->height, out->data, out->linesize);
+                if (prebuf && prebuf->filename[0] && !prebuf->running && ictx->duration > 0) {
+                    double cur = f->pts * av_q2d(ictx->fmt_ctx->streams[ictx->vstream]->time_base);
+                    if (ictx->duration - cur <= PREBUFFER_SECONDS) {
+                        prebuf->running = 1;
+                        prebuf->ready = 0;
+                        pthread_create(&prebuf->thread, NULL, prebuffer_func, prebuf);
+                    }
+                }
                 out->pts = av_rescale_q(f->pts, ictx->fmt_ctx->streams[ictx->vstream]->time_base, octx->venc_ctx->time_base) + *vpts_off;
                 encode_write(octx->venc_ctx, out, &pkt, octx->fmt_ctx, octx->vstream->index);
                 *vpts_off = out->pts + 1;
@@ -190,7 +222,7 @@ static int process(InputContext *ictx, OutputContext *octx, int64_t *vpts_off, i
                 AVFrame *f = ictx->frame;
                 AVFrame *out = av_frame_alloc();
                 out->format = octx->aenc_ctx->sample_fmt;
-                out->channel_layout = AV_CH_LAYOUT_STEREO;
+                av_channel_layout_copy(&out->ch_layout, &octx->aenc_ctx->ch_layout);
                 out->sample_rate = OUTPUT_SAMPLE_RATE;
                 out->nb_samples = av_rescale_rnd(swr_get_delay(ictx->swr, ictx->adec_ctx->sample_rate) + f->nb_samples, OUTPUT_SAMPLE_RATE, ictx->adec_ctx->sample_rate, AV_ROUND_UP);
                 av_frame_get_buffer(out, 0);
@@ -221,7 +253,7 @@ static int process(InputContext *ictx, OutputContext *octx, int64_t *vpts_off, i
     while (avcodec_receive_frame(ictx->adec_ctx, ictx->frame) >= 0) {
         AVFrame *out = av_frame_alloc();
         out->format = octx->aenc_ctx->sample_fmt;
-        out->channel_layout = AV_CH_LAYOUT_STEREO;
+        av_channel_layout_copy(&out->ch_layout, &octx->aenc_ctx->ch_layout);
         out->sample_rate = OUTPUT_SAMPLE_RATE;
         out->nb_samples = av_rescale_rnd(swr_get_delay(ictx->swr, ictx->adec_ctx->sample_rate) + ictx->frame->nb_samples, OUTPUT_SAMPLE_RATE, ictx->adec_ctx->sample_rate, AV_ROUND_UP);
         av_frame_get_buffer(out, 0);
@@ -230,6 +262,11 @@ static int process(InputContext *ictx, OutputContext *octx, int64_t *vpts_off, i
         encode_write(octx->aenc_ctx, out, &pkt, octx->fmt_ctx, octx->astream->index);
         *apts_off = out->pts + out->nb_samples;
         av_frame_free(&out);
+    }
+    if (prebuf && prebuf->filename[0] && !prebuf->running) {
+        prebuf->running = 1;
+        prebuf->ready = 0;
+        pthread_create(&prebuf->thread, NULL, prebuffer_func, prebuf);
     }
     return 0;
 }
@@ -270,18 +307,21 @@ int main(int argc, char **argv)
     PrebufferThread prebuf = {0};
 
     while (1) {
-        // start prebuffer for next file
         if (read_next_path(pl, prebuf.filename, sizeof(prebuf.filename)) == 0) {
             prebuf.ready = 0;
-            pthread_create(&prebuf.thread, NULL, prebuffer_func, &prebuf);
+            prebuf.running = 0;
         } else {
             prebuf.filename[0] = '\0';
         }
 
-        process(&ictx, &octx, &vpts_off, &apts_off);
+        process(&ictx, &octx, &vpts_off, &apts_off,
+                prebuf.filename[0] ? &prebuf : NULL);
         close_input(&ictx);
         if (prebuf.filename[0]) {
-            pthread_join(prebuf.thread, NULL);
+            if (prebuf.running)
+                pthread_join(prebuf.thread, NULL);
+            else
+                open_input(prebuf.filename, &prebuf.ictx);
             ictx = prebuf.ictx;
         } else {
             break;
